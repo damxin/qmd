@@ -1,7 +1,9 @@
 /**
- * llm.ts - LLM abstraction layer for QMD using node-llama-cpp
+ * llm.ts - LLM abstraction layer for QMD
  *
- * Provides embeddings, text generation, and reranking using local GGUF models.
+ * Provides embeddings, text generation, and reranking using either:
+ * - Local GGUF models (node-llama-cpp)
+ * - Cloud APIs (OpenAI-compatible)
  */
 
 import {
@@ -351,6 +353,21 @@ export interface LLM {
 // node-llama-cpp Implementation
 // =============================================================================
 
+/**
+ * Configuration for Cloud API backend
+ */
+export type CloudAPIConfig = {
+  apiKey?: string;
+  baseUrl?: string;
+  embedModel?: string;
+  generateModel?: string;
+  rerankModel?: string;
+  rerankBaseUrl?: string;
+};
+
+/**
+ * Configuration for LlamaCpp backend
+ */
 export type LlamaCppConfig = {
   embedModel?: string;
   generateModel?: string;
@@ -1573,6 +1590,261 @@ export function getDefaultLlamaCpp(): LlamaCpp {
  */
 export function setDefaultLlamaCpp(llm: LlamaCpp | null): void {
   defaultLlamaCpp = llm;
+}
+
+// =============================================================================
+// Cloud API Implementation
+// =============================================================================
+
+/**
+ * LLM implementation using Cloud APIs (OpenAI-compatible)
+ */
+export class CloudAPI implements LLM {
+  private apiKey: string;
+  private baseUrl: string;
+  private embedModel: string;
+  private generateModel: string;
+  private rerankModel: string;
+  private rerankBaseUrl: string;
+
+  constructor(config: CloudAPIConfig = {}) {
+    this.apiKey = config.apiKey || process.env.QMD_CLOUD_API_KEY || '';
+    this.baseUrl = config.baseUrl || process.env.QMD_CLOUD_BASE_URL || 'https://api.openai.com/v1';
+    this.embedModel = config.embedModel || process.env.QMD_CLOUD_EMBED_MODEL || 'text-embedding-3-small';
+    this.generateModel = config.generateModel || process.env.QMD_CLOUD_GENERATE_MODEL || 'gpt-4o-mini';
+    this.rerankModel = config.rerankModel || process.env.QMD_CLOUD_RERANK_MODEL || 'jina-reranker-v2-base-multilingual';
+    this.rerankBaseUrl = config.rerankBaseUrl || process.env.QMD_CLOUD_RERANK_BASE_URL || 'https://api.jina.ai/v1';
+
+    if (!this.apiKey) {
+      console.warn('QMD Warning: QMD_CLOUD_API_KEY not set - cloud API may fail');
+    }
+  }
+
+  private async fetchJson(url: string, options: RequestInit): Promise<any> {
+    const response = await fetch(url, {
+      ...options,
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${this.apiKey}`,
+        ...options.headers,
+      },
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Cloud API error (${response.status}): ${errorText}`);
+    }
+
+    return await response.json();
+  }
+
+  async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+    try {
+      const model = options.model || this.embedModel;
+      const formattedText = options.isQuery
+        ? formatQueryForEmbedding(text, model)
+        : formatDocForEmbedding(text, options.title, model);
+
+      const result = await this.fetchJson(`${this.baseUrl}/embeddings`, {
+        method: 'POST',
+        body: JSON.stringify({
+          model,
+          input: formattedText,
+        }),
+      });
+
+      return {
+        embedding: result.data[0].embedding,
+        model,
+      };
+    } catch (error) {
+      console.error('Cloud embedding error:', error);
+      return null;
+    }
+  }
+
+  async embedBatch(texts: string[], options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
+    if (texts.length === 0) return [];
+
+    try {
+      const model = options.model || this.embedModel;
+      const formattedTexts = texts.map(text =>
+        options.isQuery
+          ? formatQueryForEmbedding(text, model)
+          : formatDocForEmbedding(text, options.title, model)
+      );
+
+      const result = await this.fetchJson(`${this.baseUrl}/embeddings`, {
+        method: 'POST',
+        body: JSON.stringify({
+          model,
+          input: formattedTexts,
+        }),
+      });
+
+      return result.data.map((item: any) => ({
+        embedding: item.embedding,
+        model,
+      }));
+    } catch (error) {
+      console.error('Cloud batch embedding error:', error);
+      return texts.map(() => null);
+    }
+  }
+
+  async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
+    try {
+      const model = options.model || this.generateModel;
+      const maxTokens = options.maxTokens ?? 150;
+      const temperature = options.temperature ?? 0.7;
+
+      const result = await this.fetchJson(`${this.baseUrl}/chat/completions`, {
+        method: 'POST',
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'user', content: prompt }],
+          max_tokens: maxTokens,
+          temperature,
+        }),
+      });
+
+      return {
+        text: result.choices[0].message.content,
+        model,
+        done: true,
+      };
+    } catch (error) {
+      console.error('Cloud generation error:', error);
+      return null;
+    }
+  }
+
+  async modelExists(modelUri: string): Promise<ModelInfo> {
+    // For cloud models, we assume they exist if API key is set
+    return {
+      name: modelUri,
+      exists: !!this.apiKey,
+    };
+  }
+
+  async expandQuery(query: string, options: { context?: string, includeLexical?: boolean, intent?: string } = {}): Promise<Queryable[]> {
+    try {
+      const includeLexical = options.includeLexical ?? true;
+      const intent = options.intent;
+
+      const systemPrompt = intent
+        ? `Expand this search query: ${query}\nQuery intent: ${intent}\n\nRespond in this format exactly (one per line):\nlex: <lexical search query>\nvec: <semantic search query>\nhyde: <hypothetical document content>`
+        : `Expand this search query: ${query}\n\nRespond in this format exactly (one per line):\nlex: <lexical search query>\nvec: <semantic search query>\nhyde: <hypothetical document content>`;
+
+      const result = await this.generate(systemPrompt, {
+        maxTokens: 600,
+        temperature: 0.7,
+      });
+
+      if (!result) {
+        const fallback: Queryable[] = [{ type: 'vec', text: query }];
+        if (includeLexical) fallback.unshift({ type: 'lex', text: query });
+        return fallback;
+      }
+
+      const lines = result.text.trim().split('\n');
+      const queryables: Queryable[] = lines.map(line => {
+        const colonIdx = line.indexOf(':');
+        if (colonIdx === -1) return null;
+        const type = line.slice(0, colonIdx).trim();
+        if (type !== 'lex' && type !== 'vec' && type !== 'hyde') return null;
+        const text = line.slice(colonIdx + 1).trim();
+        return { type: type as QueryType, text };
+      }).filter((q): q is Queryable => q !== null);
+
+      const filtered = includeLexical ? queryables : queryables.filter(q => q.type !== 'lex');
+      if (filtered.length > 0) return filtered;
+
+      const fallback: Queryable[] = [
+        { type: 'hyde', text: `Information about ${query}` },
+        { type: 'lex', text: query },
+        { type: 'vec', text: query },
+      ];
+      return includeLexical ? fallback : fallback.filter(q => q.type !== 'lex');
+    } catch (error) {
+      console.error('Cloud query expansion error:', error);
+      const fallback: Queryable[] = [{ type: 'vec', text: query }];
+      if (options.includeLexical !== false) fallback.unshift({ type: 'lex', text: query });
+      return fallback;
+    }
+  }
+
+  async rerank(
+    query: string,
+    documents: RerankDocument[],
+    options: RerankOptions = {}
+  ): Promise<RerankResult> {
+    try {
+      const model = options.model || this.rerankModel;
+
+      // Use Jina AI reranker API format
+      const result = await this.fetchJson(`${this.rerankBaseUrl}/rerank`, {
+        method: 'POST',
+        body: JSON.stringify({
+          model,
+          query,
+          documents: documents.map(doc => doc.text),
+          top_n: documents.length,
+        }),
+      });
+
+      // Create a map from index to score
+      const indexToScore = new Map<number, number>();
+      result.results.forEach((item: any) => {
+        indexToScore.set(item.index, item.relevance_score);
+      });
+
+      // Build results in original order
+      const results: RerankDocumentResult[] = documents.map((doc, index) => ({
+        file: doc.file,
+        score: indexToScore.get(index) ?? 0,
+        index,
+      })).sort((a, b) => b.score - a.score);
+
+      return {
+        results,
+        model,
+      };
+    } catch (error) {
+      console.error('Cloud reranking error:', error);
+      // Fallback: return original order with dummy scores
+      const results: RerankDocumentResult[] = documents.map((doc, index) => ({
+        file: doc.file,
+        score: 1.0 - (index / documents.length),
+        index,
+      }));
+      return {
+        results,
+        model: options.model || this.rerankModel,
+      };
+    }
+  }
+
+  async dispose(): Promise<void> {
+    // Nothing to dispose for cloud API
+  }
+}
+
+// =============================================================================
+// Factory & Backend Selection
+// =============================================================================
+
+/**
+ * Create an LLM instance based on environment or config
+ */
+export function createLLM(
+  backend: 'llama.cpp' | 'cloud' = (process.env.QMD_BACKEND as 'llama.cpp' | 'cloud') || 'llama.cpp',
+  config?: LlamaCppConfig | CloudAPIConfig
+): LLM {
+  if (backend === 'cloud') {
+    return new CloudAPI(config as CloudAPIConfig);
+  }
+  return new LlamaCpp(config as LlamaCppConfig);
 }
 
 /**

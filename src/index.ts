@@ -66,6 +66,8 @@ import {
 } from "./store.js";
 import {
   LlamaCpp,
+  CloudAPI,
+  createLLM,
 } from "./llm.js";
 import {
   setConfigSource,
@@ -365,9 +367,9 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   }
   // else: DB-only mode — no external config, use existing store_collections
 
-  // Create a per-store LlamaCpp instance — lazy-loads models on first use,
-  // auto-unloads after 5 min inactivity to free VRAM.
-  const llm = new LlamaCpp({
+  // Create LLM instance based on QMD_BACKEND environment variable
+  const backend = (process.env.QMD_BACKEND as 'llama.cpp' | 'cloud') || 'llama.cpp';
+  const llm = createLLM(backend, {
     embedModel: config?.models?.embed,
     generateModel: config?.models?.generate,
     rerankModel: config?.models?.rerank,
