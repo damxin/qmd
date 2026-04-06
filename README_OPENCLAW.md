@@ -76,6 +76,9 @@ QMD 现在支持为不同功能指定不同的 API 基础地址：
 - `QMD_CLOUD_RERANK_BASE_URL`: 专门用于重排序的 API 地址。
 - `QMD_CLOUD_GENERATE_BASE_URL`: 专门用于生成/对话的 API 地址。
 
+> [!TIP]
+> **兜底逻辑**：如果您没有配置上述专项地址，QMD 会自动回退并使用 `QMD_CLOUD_BASE_URL` 作为默认地址。这意味着如果您所有的模型都在同一个服务商（如 SiliconFlow）下，您只需配置一个 `QMD_CLOUD_BASE_URL` 即可。
+
 ## 6. 常见问题 (Troubleshooting)
 
 ### Dimension Mismatch (维度不匹配)
