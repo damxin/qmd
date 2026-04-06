@@ -33,12 +33,24 @@ export function isQwen3EmbeddingModel(modelUri: string): boolean {
 }
 
 /**
+ * 检测是否为 BGE 系列嵌入模型（BAAI/bge-*）
+ * BGE 模型不需要特殊的任务前缀，直接使用原始文本
+ */
+export function isBgeEmbeddingModel(modelUri: string): boolean {
+  return /bge/i.test(modelUri) && /BAAI|large|small|base|embed/i.test(modelUri);
+}
+
+/**
  * Format a query for embedding.
  * Uses nomic-style task prefix format for embeddinggemma (default).
  * Uses Qwen3-Embedding instruct format when a Qwen embedding model is active.
  */
 export function formatQueryForEmbedding(query: string, modelUri?: string): string {
-  const uri = modelUri ?? process.env.QMD_EMBED_MODEL ?? DEFAULT_EMBED_MODEL;
+  const uri = modelUri ?? process.env.QMD_EMBED_MODEL ?? process.env.QMD_CLOUD_EMBED_MODEL ?? DEFAULT_EMBED_MODEL;
+  // BGE 模型不需要任务前缀，直接返回原始查询
+  if (isBgeEmbeddingModel(uri)) {
+    return query;
+  }
   if (isQwen3EmbeddingModel(uri)) {
     return `Instruct: Retrieve relevant documents for the given query\nQuery: ${query}`;
   }
@@ -51,7 +63,11 @@ export function formatQueryForEmbedding(query: string, modelUri?: string): strin
  * Qwen3-Embedding encodes documents as raw text without special prefixes.
  */
 export function formatDocForEmbedding(text: string, title?: string, modelUri?: string): string {
-  const uri = modelUri ?? process.env.QMD_EMBED_MODEL ?? DEFAULT_EMBED_MODEL;
+  const uri = modelUri ?? process.env.QMD_EMBED_MODEL ?? process.env.QMD_CLOUD_EMBED_MODEL ?? DEFAULT_EMBED_MODEL;
+  // BGE 模型不需要任务前缀，直接返回原始文本
+  if (isBgeEmbeddingModel(uri)) {
+    return title ? `${title}\n${text}` : text;
+  }
   if (isQwen3EmbeddingModel(uri)) {
     // Qwen3-Embedding: documents are raw text, no task prefix
     return title ? `${title}\n${text}` : text;
@@ -363,6 +379,8 @@ export type CloudAPIConfig = {
   generateModel?: string;
   rerankModel?: string;
   rerankBaseUrl?: string;
+  embedBaseUrl?: string;
+  generateBaseUrl?: string;
 };
 
 /**
@@ -1606,14 +1624,19 @@ export class CloudAPI implements LLM {
   private generateModel: string;
   private rerankModel: string;
   private rerankBaseUrl: string;
+  private embedBaseUrl: string;
+  private generateBaseUrl: string;
 
   constructor(config: CloudAPIConfig = {}) {
     this.apiKey = config.apiKey || process.env.QMD_CLOUD_API_KEY || '';
-    this.baseUrl = config.baseUrl || process.env.QMD_CLOUD_BASE_URL || 'https://api.openai.com/v1';
-    this.embedModel = config.embedModel || process.env.QMD_CLOUD_EMBED_MODEL || 'text-embedding-3-small';
-    this.generateModel = config.generateModel || process.env.QMD_CLOUD_GENERATE_MODEL || 'gpt-4o-mini';
-    this.rerankModel = config.rerankModel || process.env.QMD_CLOUD_RERANK_MODEL || 'jina-reranker-v2-base-multilingual';
-    this.rerankBaseUrl = config.rerankBaseUrl || process.env.QMD_CLOUD_RERANK_BASE_URL || 'https://api.jina.ai/v1';
+    this.baseUrl = config.baseUrl || process.env.QMD_CLOUD_BASE_URL || 'https://api.siliconflow.cn/v1';
+    this.embedModel = config.embedModel || process.env.QMD_CLOUD_EMBED_MODEL || 'BAAI/bge-large-zh-v1.5';
+    this.generateModel = config.generateModel || process.env.QMD_CLOUD_GENERATE_MODEL || 'Qwen/Qwen3.5-9B';
+    this.rerankModel = config.rerankModel || process.env.QMD_CLOUD_RERANK_MODEL || 'BAAI/bge-reranker-v2-m3';
+    // 默认使用 baseUrl 兜底
+    this.rerankBaseUrl = config.rerankBaseUrl || process.env.QMD_CLOUD_RERANK_BASE_URL || this.baseUrl;
+    this.embedBaseUrl = config.embedBaseUrl || process.env.QMD_CLOUD_EMBED_BASE_URL || this.baseUrl;
+    this.generateBaseUrl = config.generateBaseUrl || process.env.QMD_CLOUD_GENERATE_BASE_URL || this.baseUrl;
 
     if (!this.apiKey) {
       console.warn('QMD Warning: QMD_CLOUD_API_KEY not set - cloud API may fail');
@@ -1645,7 +1668,7 @@ export class CloudAPI implements LLM {
         ? formatQueryForEmbedding(text, model)
         : formatDocForEmbedding(text, options.title, model);
 
-      const result = await this.fetchJson(`${this.baseUrl}/embeddings`, {
+      const result = await this.fetchJson(`${this.embedBaseUrl}/embeddings`, {
         method: 'POST',
         body: JSON.stringify({
           model,
@@ -1674,7 +1697,7 @@ export class CloudAPI implements LLM {
           : formatDocForEmbedding(text, options.title, model)
       );
 
-      const result = await this.fetchJson(`${this.baseUrl}/embeddings`, {
+      const result = await this.fetchJson(`${this.embedBaseUrl}/embeddings`, {
         method: 'POST',
         body: JSON.stringify({
           model,
@@ -1698,7 +1721,7 @@ export class CloudAPI implements LLM {
       const maxTokens = options.maxTokens ?? 150;
       const temperature = options.temperature ?? 0.7;
 
-      const result = await this.fetchJson(`${this.baseUrl}/chat/completions`, {
+      const result = await this.fetchJson(`${this.generateBaseUrl}/chat/completions`, {
         method: 'POST',
         body: JSON.stringify({
           model,

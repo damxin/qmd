@@ -12,9 +12,11 @@ texts/
 !README.md
 !CLAUDE.md
 !CHANGELOG.md
+!README_OPENCLAW.md
 !skills/**/*.md
 !finetune/*.md
 !docs/*.md
+tests/
 finetune/outputs/
 finetune/data/train/
 .claude/

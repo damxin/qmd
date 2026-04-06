@@ -77,7 +77,7 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, CloudAPI, createLLM, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -118,7 +118,21 @@ function getStore(): ReturnType<typeof createStore> {
     try {
       const config = loadConfig();
       syncConfigToDb(store.db, config);
-      if (config.models) {
+
+      // 根据 QMD_BACKEND 环境变量决定使用本地 LlamaCpp 还是云端 CloudAPI
+      const backend = (process.env.QMD_BACKEND as 'llama.cpp' | 'cloud') || 'llama.cpp';
+      if (backend === 'cloud') {
+        // Cloud 模式：使用 CloudAPI 实例
+        const cloudLlm = createLLM('cloud', {
+          apiKey: process.env.QMD_CLOUD_API_KEY,
+          baseUrl: process.env.QMD_CLOUD_BASE_URL,
+          embedModel: config.models?.embed || process.env.QMD_CLOUD_EMBED_MODEL,
+          generateModel: config.models?.generate || process.env.QMD_CLOUD_GENERATE_MODEL,
+          rerankModel: config.models?.rerank || process.env.QMD_CLOUD_RERANK_MODEL,
+        });
+        store.llm = cloudLlm;
+      } else if (config.models) {
+        // 本地模式：使用 LlamaCpp 实例
         setDefaultLlamaCpp(new LlamaCpp({
           embedModel: config.models.embed,
           generateModel: config.models.generate,
@@ -447,47 +461,72 @@ async function showStatus(): Promise<void> {
     console.log(`\n${c.dim}No collections. Run 'qmd collection add .' to index markdown files.${c.reset}`);
   }
 
-  // Models
+  // Models & Device info
   {
-    // hf:org/repo/file.gguf → https://huggingface.co/org/repo
-    const hfLink = (uri: string) => {
-      const match = uri.match(/^hf:([^/]+\/[^/]+)\//);
-      return match ? `https://huggingface.co/${match[1]}` : uri;
-    };
-    console.log(`\n${c.bold}Models${c.reset}`);
-    console.log(`  Embedding:   ${hfLink(DEFAULT_EMBED_MODEL_URI)}`);
-    console.log(`  Reranking:   ${hfLink(DEFAULT_RERANK_MODEL_URI)}`);
-    console.log(`  Generation:  ${hfLink(DEFAULT_GENERATE_MODEL_URI)}`);
-  }
+    const backend = (process.env.QMD_BACKEND as 'llama.cpp' | 'cloud') || 'llama.cpp';
+    if (backend === 'cloud') {
+      // 云端模式：显示云端模型配置
+      console.log(`\n${c.bold}Backend${c.reset}`);
+      console.log(`  Mode:       ${c.green}cloud${c.reset} (SiliconFlow API)`);
+      const defaultUrl = process.env.QMD_CLOUD_BASE_URL || 'https://api.siliconflow.cn/v1';
+      console.log(`  Base URL:   ${defaultUrl}`);
+      
+      if (process.env.QMD_CLOUD_EMBED_BASE_URL && process.env.QMD_CLOUD_EMBED_BASE_URL !== defaultUrl) {
+         console.log(`  Embed URL:  ${process.env.QMD_CLOUD_EMBED_BASE_URL}`);
+      }
+      if (process.env.QMD_CLOUD_RERANK_BASE_URL && process.env.QMD_CLOUD_RERANK_BASE_URL !== defaultUrl) {
+         console.log(`  Rerank URL: ${process.env.QMD_CLOUD_RERANK_BASE_URL}`);
+      }
+      if (process.env.QMD_CLOUD_GENERATE_BASE_URL && process.env.QMD_CLOUD_GENERATE_BASE_URL !== defaultUrl) {
+         console.log(`  Gen URL:    ${process.env.QMD_CLOUD_GENERATE_BASE_URL}`);
+      }
 
-  // Device / GPU info
-  try {
-    const llm = getDefaultLlamaCpp();
-    const device = await llm.getDeviceInfo();
-    console.log(`\n${c.bold}Device${c.reset}`);
-    if (device.gpu) {
-      console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);
-      if (device.gpuDevices.length > 0) {
-        // Deduplicate and count GPUs
-        const counts = new Map<string, number>();
-        for (const name of device.gpuDevices) {
-          counts.set(name, (counts.get(name) || 0) + 1);
-        }
-        const deviceStr = Array.from(counts.entries())
-          .map(([name, count]) => count > 1 ? `${count}× ${name}` : name)
-          .join(', ');
-        console.log(`  Devices:  ${deviceStr}`);
-      }
-      if (device.vram) {
-        console.log(`  VRAM:     ${formatBytes(device.vram.free)} free / ${formatBytes(device.vram.total)} total`);
-      }
+      console.log(`  Embedding:  ${process.env.QMD_CLOUD_EMBED_MODEL || 'BAAI/bge-large-zh-v1.5'}`);
+      console.log(`  Reranking:  ${process.env.QMD_CLOUD_RERANK_MODEL || 'BAAI/bge-reranker-v2-m3'}`);
+      console.log(`  Generation: ${process.env.QMD_CLOUD_GENERATE_MODEL || 'Qwen/Qwen3.5-9B'}`);
+      console.log(`  API Key:    ${process.env.QMD_CLOUD_API_KEY ? '***' + process.env.QMD_CLOUD_API_KEY.slice(-6) : c.yellow + 'not set' + c.reset}`);
     } else {
-      console.log(`  GPU:      ${c.yellow}none${c.reset} (running on CPU — models will be slow)`);
-      console.log(`  ${c.dim}Tip: Install CUDA, Vulkan, or Metal support for GPU acceleration.${c.reset}`);
+      // 本地模式：显示本地模型和设备信息
+      // hf:org/repo/file.gguf → https://huggingface.co/org/repo
+      const hfLink = (uri: string) => {
+        const match = uri.match(/^hf:([^/]+\/[^/]+)\//);
+        return match ? `https://huggingface.co/${match[1]}` : uri;
+      };
+      console.log(`\n${c.bold}Models${c.reset}`);
+      console.log(`  Embedding:   ${hfLink(DEFAULT_EMBED_MODEL_URI)}`);
+      console.log(`  Reranking:   ${hfLink(DEFAULT_RERANK_MODEL_URI)}`);
+      console.log(`  Generation:  ${hfLink(DEFAULT_GENERATE_MODEL_URI)}`);
+
+      // Device / GPU info
+      try {
+        const llm = getDefaultLlamaCpp();
+        const device = await llm.getDeviceInfo();
+        console.log(`\n${c.bold}Device${c.reset}`);
+        if (device.gpu) {
+          console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);
+          if (device.gpuDevices.length > 0) {
+            // Deduplicate and count GPUs
+            const counts = new Map<string, number>();
+            for (const name of device.gpuDevices) {
+              counts.set(name, (counts.get(name) || 0) + 1);
+            }
+            const deviceStr = Array.from(counts.entries())
+              .map(([name, count]) => count > 1 ? `${count}× ${name}` : name)
+              .join(', ');
+            console.log(`  Devices:  ${deviceStr}`);
+          }
+          if (device.vram) {
+            console.log(`  VRAM:     ${formatBytes(device.vram.free)} free / ${formatBytes(device.vram.total)} total`);
+          }
+        } else {
+          console.log(`  GPU:      ${c.yellow}none${c.reset} (running on CPU — models will be slow)`);
+          console.log(`  ${c.dim}Tip: Install CUDA, Vulkan, or Metal support for GPU acceleration.${c.reset}`);
+        }
+        console.log(`  CPU:      ${device.cpuCores} math cores`);
+      } catch {
+        // Don't fail status if LLM init fails
+      }
     }
-    console.log(`  CPU:      ${device.cpuCores} math cores`);
-  } catch {
-    // Don't fail status if LLM init fails
   }
 
   // Tips section
